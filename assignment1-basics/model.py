@@ -1,4 +1,6 @@
 # from turtle import forward
+from turtle import forward, position
+from numpy import diag
 import torch
 from math import sqrt
 from einops import einsum, rearrange
@@ -77,87 +79,167 @@ class Softmax(nn.Module):
 
 
 class SDPA(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
-        self.softmax = Softmax(dim=-1)
-    def forward(self, 
-                Q:Float[Tensor, "... queries d_k"],
-                K:Float[Tensor, "... keys d_k"],
-                V:Float[Tensor, "... values d_v"],
-                mask:Float[Tensor, "... queries keys"]):
+        self.softmax = nn.Softmax(dim=-1)
+    
+    def forward( self, 
+                 Q: Float[Tensor, "... queries d_k"]=None,
+                 K: Float[Tensor, "... keys d_k"]=None,
+                 V: Float[Tensor, "... values d_v"]=None,
+                 mask: Float[Tensor, "... queries keys"]=None):
         d_k = Q.shape[-1]
-        attn_weight = torch.einsum("...qd,...kd->...qk", Q, K)/sqrt(d_k)+mask
-        attn_logits = self.softmax(attn_weight)
+        keys = K.shape[-2]
+        values = V.shape[-2]
+        assert keys == values
+        attn_weight = torch.einsum("... qd,... kd->...qk", Q,K)/sqrt(d_k) + mask
+        attn_weight:Float[Tensor, "... queries keys"] = self.softmax(attn_weight)
+        return torch.einsum("... qk, ... kv->... qv", attn_weight, V)
 
-        return torch.einsum("bhqk, bhkv->bhqv", attn_logits, V)
 
 class MHA(nn.Module):
     def __init__(self, 
-                d_k:int,
-                d_model:int,
-                num_heads:int,
-                query_weight:Float[Tensor, "d_k d_model"]=None, 
-                key_weight:Float[Tensor, "d_k d_model"]=None, 
-                value_weight:Float[Tensor, "d_k d_model"]=None,
-                out_weight:Float[Tensor, "d_model d_k"]=None) -> None:
+                 d_model, 
+                 num_heads,
+                 q_proj_weight: Float[Tensor, " d_k d_in"],
+                 k_proj_weight: Float[Tensor, " d_k d_in"],
+                 v_proj_weight: Float[Tensor, " d_v d_in"],
+                 o_proj_weight: Float[Tensor, " d_model d_v"]) -> None:
         super().__init__()
-        
-        self.weight_list = nn.ParameterList()
-        self.num_heads = num_heads
-        self.attn = SDPA()
-        self.d_k = d_k
+        self.q_proj = nn.Parameter(q_proj_weight)
+        self.k_proj = nn.Parameter(k_proj_weight)
+        self.v_proj = nn.Parameter(v_proj_weight)
+        self.o_proj = nn.Parameter(o_proj_weight)
         self.d_model = d_model
+        self.num_heads = num_heads
+        self.sdpa = SDPA()
+    
+    def forward(self, in_features: Float[Tensor, " ... seq d_in"]) -> Float[Tensor, "... seq d_model"]:
+        v = self.v_proj.shape[0]
+        def reshape_and_gemm(input:Float[Tensor, "... seq d_in"], weight:Float[Tensor, "d d_in"]):
+            d = weight.shape[0]
+            d_split = d//self.num_heads
+            weight = einops.rearrange(weight, "(h d) i-> h d i", h=self.num_heads, d=d_split)
+            return einops.einsum(input, weight, "... s i, h d i-> ... h s d")
+        query = reshape_and_gemm(in_features, self.q_proj)
+        key = reshape_and_gemm(in_features, self.k_proj)
+        value = reshape_and_gemm(in_features, self.v_proj)
+        seq = in_features.shape[-2]
+        mask = torch.ones(size = (seq, seq),dtype=query.dtype, device = query.device) * (-1e8)
+        mask = torch.triu(mask, diagonal=1)
+        attn_out:Float[Tensor, "bsz head seq d_v//head"] = einops.rearrange(self.sdpa(query, key, value, mask), "... h s d -> ... s (h d)")
+        return einops.einsum(attn_out, self.o_proj, "... v, m v-> ... m")
 
-        for weight in [query_weight, key_weight, value_weight, out_weight]:
-            if weight is None:
-                self.weight_list.append(self.init_weight(d_k,d_model))
-            else:
-                self.weight_list.append(nn.Parameter(weight))
 
-
-
-    def init_weight(self, d_k:int, d_model:int)->nn.Parameter:
-        sigma = sqrt(2/(d_k+d_model))
-        weight = torch.empty(size=(d_k, d_model))
-        torch.nn.init.trunc_normal_(weight, std=sigma, a=-3*sigma, b=3*sigma)
-        return nn.Parameter(weight)
-
-    def forward(self, in_feature:Float[Tensor,"... seq d_model"]):
-        q_proj, k_proj, v_proj, o_proj = self.weight_list
-        def map_and_reshape(input:Float[Tensor, "bsz seq d_model"], weight:Float[Tensor, "d_k d_model"])->Float[Tensor, "bsz num_heads seq d_k"]:
-            total_dim = input.shape[0]
-            # input_inter = torch.einsum("bsm, km->bsk", input, weight)
-            output = einops.einsum(input, weight, "b s m, (h d) m-> b h s d",h=self.num_heads, d=int(total_dim/self.num_heads))
-            # bsz, seq, total_dim = input_inter.shape
-            # d_k = int(total_dim/self.num_heads)
-            # output:Float[Tensor, "bsz num_heads seq d_k"] = input_inter.view(bsz, seq, self.num_heads, d_k).transpose(1,2)
-            
-            return output
-        Q = map_and_reshape(in_feature, q_proj)
-        K = map_and_reshape(in_feature, k_proj)
-        V = map_and_reshape(in_feature, v_proj)
-        bsz, num_heads, seq, d_k = Q.shape
-        mask = torch.triu(-1e9 * torch.ones(seq, seq),diagonal=1).to(Q.device)
-        attn_output:Float[Tensor, "bsz seq d_k"] = self.attn(Q, K, V, mask).transpose(1,2).contiguous().view(bsz, seq, num_heads*d_k)
-        attn_output = torch.einsum("... i, ji->...j", attn_output, o_proj)
-        return attn_output
 
 class RoPE(nn.Module):
-    def __init__(self, theta: float, 
-                       max_sequence_length: int, 
-                       d_k: int) -> None:
+    def __init__(self, 
+                theta: float, 
+                max_sequence_length: int, 
+                d_k: int) -> None:
         super().__init__()
-        self.theta = theta
+        self.theta = theta #这个theta就是其他的模型中的base, 默认是10000
         self.max_sequence_length = max_sequence_length
         self.d_k = d_k
+        self._get_inv_freq()
+        if max_sequence_length != None:
+            self._set_cos_sin_cache()
     
-    def _set_cos_sin_cache(self, token_positions:int[Tensor, "... seq"]):
-        if self.max_sequence_length == None:
-            self.max_sequence_length = token_positions.shape[-1]
-        self.
+    def _get_inv_freq(self):
+        assert self.d_k % 2 == 0
+        idx = torch.arange(0, self.d_k, 2).float()
+        inv_freq:Float[Tensor, self.d_k/2 - 1] = 1.0/(
+            self.theta ** (idx/self.d_k)
+        ) # 10000^{-2i/d}, 其中10000是theta
+        self.register_buffer("inv_freq", inv_freq) #[theta_0, theta_1, ...]
+
+    
+    def _set_cos_sin_cache(self):            
+        
+        freq = torch.einsum("i,j->ij", torch.arange(self.max_sequence_length).float(), self.inv_freq) #[seq, d_k/2]
+        freq = torch.cat([freq,freq],dim=-1) #[seq, d_k]
+        self.register_buffer("cos", freq.cos())
+        self.register_buffer("sin", freq.sin())
+    
+    def forward(self, token_positions: Int[Tensor, "... seq"]):
+        max_pos = token_positions.max().item()
+        if self.max_sequence_length == None or self.max_sequence_length <= max_pos:
+            self.max_sequence_length = max_pos+1
+            self._set_cos_sin_cache()
+        return self.cos[token_positions], self.sin[token_positions]
+
+def apply_rope(x, cos:Float[Tensor, "bsz seq dim"], sin:Float[Tensor, "bsz seq dim"]):
+    cos = cos.unsqueeze(1) # [bsz 1 seq dim]
+    sin = sin.unsqueeze(1)
+    x_embed = x * cos + rotate_half(x) * sin
+    return x_embed
+
+def rotate_half(x):
+    d = x.shape[-1]
+    x1 = x[..., :d//2]
+    x2 = x[..., d//2:]
+    return torch.cat([-x2, x1], dim=-1)
 
 
 
+class MHA_With_RoPE(nn.Module):
+    def __init__(self, 
+                d_model: int,
+                num_heads: int,
+                max_seq_len: int,
+                theta: float,
+                q_proj_weight: Float[Tensor, " d_k d_in"],
+                k_proj_weight: Float[Tensor, " d_k d_in"],
+                v_proj_weight: Float[Tensor, " d_v d_in"],
+                o_proj_weight: Float[Tensor, " d_model d_v"],) -> None:
+        super().__init__()
+        # self.d_model = d_model
+        self.num_heads = num_heads
+        self.q_proj = q_proj_weight
+        self.k_proj = k_proj_weight
+        self.v_proj = v_proj_weight
+        self.o_proj = o_proj_weight
+        if q_proj_weight == None:
+            d_split = d_model//num_heads
+        else:
+            d_k = q_proj_weight.shape[0]
+            d_split = d_k//num_heads
+
+        self.rope = RoPE(theta, max_seq_len, d_split)
+        self.sdpa = SDPA()
+    
+    def forward(self, 
+                in_features:Float[Tensor, "... seq d_in"], 
+                token_positions: Int[Tensor, "... seq"]):
+        
+        def map_and_gemm(in_features:Float[Tensor, "... seq d_in"], weight:Float[Tensor, "d_out d_in"]):
+            d_out = weight.shape[0]
+            d_split = d_out//self.num_heads
+            weight = einops.rearrange(weight, "(h d) i->h d i", h=self.num_heads, d=d_split)
+            return einops.einsum(in_features, weight, "... s i, h d i -> ... h s d")
+        q = map_and_gemm(in_features, self.q_proj)
+        k = map_and_gemm(in_features, self.k_proj)
+        v = map_and_gemm(in_features, self.v_proj)
+
+        # 绑定rope
+        cos, sin = self.rope(token_positions)
+        q_embed = apply_rope(q, cos, sin)
+        k_embed = apply_rope(k, cos, sin)
+
+        seq_len = token_positions.shape[-1]
+        # 计算attn out
+        mask = torch.ones(size=(seq_len, seq_len),dtype = torch.float, device = q_embed.device) * (-1e8)
+        mask = torch.triu(mask, diagonal=1)
+        attn_out = self.sdpa(q_embed, k_embed, v, mask)
+        
+        #计算最终输出
+        attn_out = einops.rearrange(attn_out, "... h s v -> ... s (h v)")
+        return einops.einsum(attn_out, self.o_proj, "... s v, m v -> ... s m")
+
+
+
+
+    
 
 
 

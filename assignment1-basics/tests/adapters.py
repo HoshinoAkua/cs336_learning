@@ -52,7 +52,7 @@ def run_embedding(
     """
     model = Embedding(vocab_size, d_model, weights)
     return model(token_ids)
-
+from model import SwiGLU
 
 def run_swiglu(
     d_model: int,
@@ -83,9 +83,10 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    model = SwiGLU(d_model, d_ff, w1_weight, w2_weight, w3_weight)
+    return model(in_features)
 
-
+from model import SDPA
 def run_scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys d_k"],
@@ -104,8 +105,10 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    model = SDPA()
+    return model(Q, K, V, mask)
 
+from model import MHA
 
 def run_multihead_self_attention(
     d_model: int,
@@ -138,7 +141,8 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    model = MHA(d_model,num_heads, q_proj_weight, k_proj_weight, v_proj_weight, o_proj_weight)
+    return model(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -181,6 +185,8 @@ def run_multihead_self_attention_with_rope(
     raise NotImplementedError
 
 
+from model import RoPE, apply_rope
+
 def run_rope(
     d_k: int,
     theta: float,
@@ -200,7 +206,9 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    model = RoPE(theta, max_seq_len, d_k)
+    cos, sin = model(token_positions)
+    return apply_rope(in_query_or_key, cos, sin)
 
 
 def run_transformer_block(
