@@ -126,7 +126,7 @@ class MHA(nn.Module):
         value = reshape_and_gemm(in_features, self.v_proj)
         seq = in_features.shape[-2]
         mask = torch.ones(size = (seq, seq),dtype=query.dtype, device = query.device) * (-1e8)
-        mask = torch.triu(mask, diagonal=1)
+        mask = torch.triu(mask, diagonal=1).unsqueeze(0).unsqueeze(0) # 假设模型 1.没有past_key_value 2.一定是bsz head seq d 这种形状的
         attn_out:Float[Tensor, "bsz head seq d_v//head"] = einops.rearrange(self.sdpa(query, key, value, mask), "... h s d -> ... s (h d)")
         return einops.einsum(attn_out, self.o_proj, "... v, m v-> ... m")
 
@@ -168,7 +168,8 @@ class RoPE(nn.Module):
             self._set_cos_sin_cache()
         return self.cos[token_positions], self.sin[token_positions]
 
-def apply_rope(x, cos:Float[Tensor, "bsz seq dim"], sin:Float[Tensor, "bsz seq dim"]):
+def apply_rope(x:Float[Tensor, "... seq dim"], 
+               cos:Float[Tensor, "... seq dim"], sin:Float[Tensor, "... seq dim"]):
     cos = cos.unsqueeze(1) # [bsz 1 seq dim]
     sin = sin.unsqueeze(1)
     x_embed = x * cos + rotate_half(x) * sin
@@ -194,11 +195,10 @@ class MHA_With_RoPE(nn.Module):
                 o_proj_weight: Float[Tensor, " d_model d_v"],) -> None:
         super().__init__()
         # self.d_model = d_model
-        self.num_heads = num_heads
-        self.q_proj = q_proj_weight
-        self.k_proj = k_proj_weight
-        self.v_proj = v_proj_weight
-        self.o_proj = o_proj_weight
+        self.q_proj = nn.Parameter(q_proj_weight)
+        self.k_proj = nn.Parameter(k_proj_weight)
+        self.v_proj = nn.Parameter(v_proj_weight)
+        self.o_proj = nn.Parameter(o_proj_weight)
         if q_proj_weight == None:
             d_split = d_model//num_heads
         else:
@@ -236,7 +236,167 @@ class MHA_With_RoPE(nn.Module):
         attn_out = einops.rearrange(attn_out, "... h s v -> ... s (h v)")
         return einops.einsum(attn_out, self.o_proj, "... s v, m v -> ... s m")
 
+class RMSNorm(nn.Module):
+    def __init__(self, 
+                 d_model, 
+                 eps,
+                 weights) -> None:
+        super().__init__()
+        self.weights = weights
+        self.eps = eps
+        self.d_model = d_model
+    def forward(self, in_features: Float[Tensor, " ... seq d_model"]):
+        o_dtype = in_features.dtype
+        in_features = in_features.to(torch.float32)
+        var = torch.sum((in_features)**2,dim=-1,keepdim=True)/self.d_model
+        in_inter = in_features*torch.rsqrt(var+self.eps).to(o_dtype)
+        return in_inter * self.weights
 
+
+class TransformerBlock(nn.Module):
+    def __init__(self,
+                d_model: int,
+                num_heads: int,
+                d_ff: int,
+                max_seq_len: int,
+                theta: float,
+                weights: dict[str, Tensor]) -> None:
+        super().__init__()
+
+        self.attn_rmsnorm = RMSNorm(d_model, eps=1e-6, weights=weights["ln1.weight"])
+        self.mlp_rmsnorm = RMSNorm(d_model, eps=1e-6, weights=weights["ln2.weight"])
+
+        self.attn = MHA_With_RoPE(d_model,
+                                  num_heads,
+                                  max_seq_len,
+                                  theta,
+                                  weights["attn.q_proj.weight"],
+                                  weights["attn.k_proj.weight"],
+                                  weights["attn.v_proj.weight"],
+                                  weights["attn.o_proj.weight"])
+        self.mlp = SwiGLU(d_model,
+                          d_ff,
+                          weights["ffn.w1.weight"],
+                          weights["ffn.w2.weight"],
+                          weights["ffn.w3.weight"])
+        
+
+    def forward(self, in_features: Float[Tensor, "... seq d_model"]
+                    ,token_positions: Int[Tensor, "... seq"] = None):
+
+        res = in_features
+
+        in_features = self.attn_rmsnorm(in_features)
+        if token_positions == None:
+            seq_len = in_features.shape[-2]
+            token_positions = torch.arange(seq_len, device=res.device,dtype=torch.long)
+            token_positions = token_positions.unsqueeze(0)
+        attn_out = self.attn(in_features, token_positions) + res
+
+        res = attn_out
+
+        in_features = self.mlp_rmsnorm(in_features)
+        mlp_out = self.mlp(in_features)
+
+        return mlp_out + res
+
+class DecoderLayer(nn.Module):
+    def __init__(self,
+                d_model: int,
+                num_heads: int,
+                d_ff: int,
+                max_seq_len: int,
+                theta: float,
+                layer_idx: int,
+                weights: dict[str, Tensor]) -> None:
+        super().__init__()
+
+        self.attn_rmsnorm = RMSNorm(d_model, eps=1e-6, weights=weights[f"layers.{layer_idx}.ln1.weight"])
+        self.mlp_rmsnorm = RMSNorm(d_model, eps=1e-6, weights=weights[f"layers.{layer_idx}.ln2.weight"])
+
+        self.attn = MHA_With_RoPE(d_model,
+                                  num_heads,
+                                  max_seq_len,
+                                  theta,
+                                  weights[f"layers.{layer_idx}.attn.q_proj.weight"],
+                                  weights[f"layers.{layer_idx}.attn.k_proj.weight"],  
+                                  weights[f"layers.{layer_idx}.attn.v_proj.weight"],
+                                  weights[f"layers.{layer_idx}.attn.o_proj.weight"])
+        self.mlp = SwiGLU(d_model,
+                          d_ff,
+                          weights[f"layers.{layer_idx}.ffn.w1.weight"],
+                          weights[f"layers.{layer_idx}.ffn.w2.weight"],
+                          weights[f"layers.{layer_idx}.ffn.w3.weight"])
+        
+
+    def forward(self, in_features: Float[Tensor, "... seq d_model"]
+                    ,token_positions: Int[Tensor, "... seq"] = None):
+
+        res = in_features
+
+        in_features = self.attn_rmsnorm(in_features)
+        if token_positions == None:
+            seq_len = in_features.shape[-2]
+            token_positions = torch.arange(seq_len, device=res.device,dtype=torch.long)
+            token_positions = token_positions.unsqueeze(0)
+        attn_out = self.attn(in_features, token_positions) + res
+
+        res = attn_out
+
+        in_features = self.mlp_rmsnorm(in_features)
+        mlp_out = self.mlp(in_features)
+
+        return mlp_out + res
+
+class LmHead(nn.Module):
+    def __init__(self, weight:Float[Tensor, "vocab_size d_model"], vocab_size:int, d_model:int) -> None:
+        super().__init__()
+        self.weight = weight
+    
+    def forward(self, in_features:Float[Tensor, "... seq d_model"]):
+        return einops.einsum(in_features, self.weight, "... d, v d -> ... v")
+
+
+class Model(nn.Module):
+    def __init__(self, vocab_size:int,
+                    max_seq_len:int,
+                    d_model: int,
+                    num_layers: int,
+                    num_heads: int,
+                    d_ff: int,
+                    rope_theta: float,
+                    weights: dict[str, Tensor]) -> None:
+        super().__init__()
+        self.embed_layer = Embedding(vocab_size, 
+                                     d_model,
+                                     weight = weights["token_embeddings.weight"])
+        self.num_layers = num_layers
+        self.decoder = nn.ModuleList([
+            DecoderLayer(d_model,
+                         num_heads,
+                         d_ff,
+                         max_seq_len,
+                         rope_theta,
+                         layer_idx=i,
+                         weights=weights) for i in range(num_layers)
+        ])
+
+        self.lm_head = LmHead(weights["lm_head.weight"], vocab_size, d_model)
+        self.ln = RMSNorm(d_model, eps=1e-6, weights=weights["ln_final.weight"])
+    
+    def forward(self, in_indices:Int[Tensor, "bsz seq"]):
+        in_features = self.embed_layer(in_indices)
+
+        for idx in range(self.num_layers):
+            in_features = self.decoder[idx](in_features)
+        
+        in_features = self.ln(in_features)
+
+        return self.lm(in_features)
+
+
+
+        
 
 
     

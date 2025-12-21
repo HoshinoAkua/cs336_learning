@@ -145,6 +145,8 @@ def run_multihead_self_attention(
     return model(in_features)
 
 
+from model import MHA_With_RoPE
+
 def run_multihead_self_attention_with_rope(
     d_model: int,
     num_heads: int,
@@ -182,7 +184,8 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    model = MHA_With_RoPE(d_model, num_heads, max_seq_len, theta, q_proj_weight, k_proj_weight, v_proj_weight, o_proj_weight)
+    return model(in_features, token_positions)
 
 
 from model import RoPE, apply_rope
@@ -210,6 +213,8 @@ def run_rope(
     cos, sin = model(token_positions)
     return apply_rope(in_query_or_key, cos, sin)
 
+
+from model import TransformerBlock
 
 def run_transformer_block(
     d_model: int,
@@ -281,7 +286,8 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    model = TransformerBlock(d_model, num_heads, d_ff, max_seq_len, theta, weights)
+    return model(in_features)
 
 
 def run_transformer_lm(
@@ -365,7 +371,7 @@ def run_transformer_lm(
     """
     raise NotImplementedError
 
-
+from model import RMSNorm
 def run_rmsnorm(
     d_model: int,
     eps: float,
@@ -386,7 +392,8 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    model = RMSNorm(d_model, eps, weights)
+    return model(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
