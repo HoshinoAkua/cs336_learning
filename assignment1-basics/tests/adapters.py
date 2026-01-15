@@ -188,7 +188,7 @@ def run_multihead_self_attention_with_rope(
     return model(in_features, token_positions)
 
 
-from model import RoPE, apply_rope
+from model import RoPE, apply_rope, test_apply_rope
 
 def run_rope(
     d_k: int,
@@ -211,7 +211,7 @@ def run_rope(
     """
     model = RoPE(theta, max_seq_len, d_k)
     cos, sin = model(token_positions)
-    return apply_rope(in_query_or_key, cos, sin)
+    return test_apply_rope(in_query_or_key, cos, sin)
 
 
 from model import TransformerBlock
@@ -369,7 +369,18 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    from model import Model
+    model = Model(
+        vocab_size=vocab_size,
+        max_seq_len=context_length,
+        d_model=d_model,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        rope_theta=rope_theta,
+        weights=weights
+    )
+    return model(in_indices)
 
 from model import RMSNorm
 def run_rmsnorm(
@@ -396,6 +407,8 @@ def run_rmsnorm(
     return model(in_features)
 
 
+from model import SiLU
+
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
     """Given a tensor of inputs, return the output of applying SiLU
     to each element.
@@ -407,9 +420,10 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    model = SiLU()
+    return model(in_features)
 
-
+from model import MyDataset
 def run_get_batch(
     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -430,9 +444,11 @@ def run_get_batch(
         is the sampled input sequences, and the second tuple item is the corresponding
         language modeling labels.
     """
-    raise NotImplementedError
+    dataset = iter(MyDataset(dataset,context_length, batch_size, device))
+    return next(dataset)
 
 
+from model import Softmax
 def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, " ..."]:
     """
     Given a tensor of inputs, return the output of softmaxing the given `dim`
@@ -446,7 +462,9 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
+    model = Softmax(dim)
+    return model(in_features)
+
 
 
 def run_cross_entropy(
@@ -464,7 +482,10 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    from model import CrossEntropy
+    criterion = CrossEntropy()
+    return criterion(inputs, targets)
+
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -476,16 +497,20 @@ def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm:
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    from model import GradClipper
+    clipper = GradClipper(parameters)
+    clipper(max_l2_norm)
 
 
+from torch.optim import AdamW
 def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
+import math
 def run_get_lr_cosine_schedule(
     it: int,
     max_learning_rate: float,
@@ -511,7 +536,13 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    if it < warmup_iters:
+        return max_learning_rate * it / warmup_iters
+    if it > cosine_cycle_iters:
+        return min_learning_rate
+    decay_ratio = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_learning_rate + coeff * (max_learning_rate - min_learning_rate)
 
 
 def run_save_checkpoint(
@@ -530,7 +561,12 @@ def run_save_checkpoint(
             we've completed.
         out (str | os.PathLike | BinaryIO | IO[bytes]): Path or file-like object to serialize the model, optimizer, and iteration to.
     """
-    raise NotImplementedError
+    checkpoint = {
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'iteration': iteration,
+    }
+    torch.save(checkpoint, out)
 
 
 def run_load_checkpoint(
@@ -551,7 +587,10 @@ def run_load_checkpoint(
     Returns:
         int: the previously-serialized number of iterations.
     """
-    raise NotImplementedError
+    checkpoint = torch.load(src)
+    model.load_state_dict(checkpoint['model'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    return checkpoint['iteration']
 
 
 def get_tokenizer(
@@ -574,7 +613,8 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    from model import BPETokenizer
+    return BPETokenizer(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -604,4 +644,5 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    from model import train_bpe
+    return train_bpe(input_path, vocab_size, special_tokens)

@@ -1,6 +1,4 @@
-# from turtle import forward
-from turtle import forward, position
-from numpy import diag
+import numpy as np
 import torch
 from math import sqrt
 from einops import einsum, rearrange
@@ -8,6 +6,7 @@ import einops
 from jaxtyping import Float, Int
 from typing import Union
 from torch import Tensor, nn
+from torch.optim import Optimizer
 
 class Linear(nn.Module):
     def __init__(self, 
@@ -39,6 +38,20 @@ class Embedding(nn.Module):
     def forward(self, token_ids: Int[Tensor, "..."]):
         return self.weight[token_ids]
 
+class SiLU(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+    
+    def sigmoid(self, x):
+        return 1/(1+torch.exp(-x))
+    
+    def forward(self, in_features):
+        return in_features * self.sigmoid(in_features)
+
+
+
+
+
 class SwiGLU(nn.Module):
     def __init__(self,  d_model: int, 
                         d_ff: int,
@@ -46,7 +59,7 @@ class SwiGLU(nn.Module):
                         w2_weight:Union[Float[Tensor, "d_model d_ff"]|None],
                         w3_weight:Union[Float[Tensor, "d_ff d_model"]|None]) -> None:
         super().__init__()
-
+        self.act_fn = nn.SiLU()
         
         self.weight_list = nn.ParameterList()
         for weight,shape in zip([w1_weight, w2_weight, w3_weight],
@@ -65,10 +78,10 @@ class SwiGLU(nn.Module):
         return nn.Parameter(weight)
     
     def forward(self, in_feature:Float[Tensor, "... d_model"]):
-        up_proj, down_proj, gate_proj = self.weight_list
+        gate_proj, down_proj, up_proj = self.weight_list
         up_inter = torch.einsum("... i, ji->... j", in_feature, up_proj)
-        gate_inter = nn.SiLU(torch.einsum("... i,ji->... j", in_feature, gate_proj))*up_inter
-        return torch.einsum("... j,ij", gate_inter, down_proj)
+        gate_inter = self.act_fn(torch.einsum("... i,ji->... j", in_feature, gate_proj))*up_inter
+        return torch.einsum("... j,ij->... i", gate_inter, down_proj)
 
 class Softmax(nn.Module):
     def __init__(self, dim:int) -> None:
@@ -92,7 +105,8 @@ class SDPA(nn.Module):
         keys = K.shape[-2]
         values = V.shape[-2]
         assert keys == values
-        attn_weight = torch.einsum("... qd,... kd->...qk", Q,K)/sqrt(d_k) + mask
+        attn_weight = torch.einsum("... qd,... kd->...qk", Q,K)/sqrt(d_k)
+        attn_weight = attn_weight.masked_fill(~mask, float("-inf"))
         attn_weight:Float[Tensor, "... queries keys"] = self.softmax(attn_weight)
         return torch.einsum("... qk, ... kv->... qv", attn_weight, V)
 
@@ -125,8 +139,8 @@ class MHA(nn.Module):
         key = reshape_and_gemm(in_features, self.k_proj)
         value = reshape_and_gemm(in_features, self.v_proj)
         seq = in_features.shape[-2]
-        mask = torch.ones(size = (seq, seq),dtype=query.dtype, device = query.device) * (-1e8)
-        mask = torch.triu(mask, diagonal=1).unsqueeze(0).unsqueeze(0) # 假设模型 1.没有past_key_value 2.一定是bsz head seq d 这种形状的
+        mask = torch.ones(size = (seq, seq),device = query.device,dtype=torch.bool)
+        mask = torch.tril(mask).unsqueeze(0).unsqueeze(0) # 假设模型 1.没有past_key_value 2.一定是bsz head seq d 这种形状的
         attn_out:Float[Tensor, "bsz head seq d_v//head"] = einops.rearrange(self.sdpa(query, key, value, mask), "... h s d -> ... s (h d)")
         return einops.einsum(attn_out, self.o_proj, "... v, m v-> ... m")
 
@@ -168,10 +182,39 @@ class RoPE(nn.Module):
             self._set_cos_sin_cache()
         return self.cos[token_positions], self.sin[token_positions]
 
+def test_apply_rope(x: Float[Tensor, "... seq dim"], 
+               cos: Float[Tensor, "... seq dim"], 
+               sin: Float[Tensor, "... seq dim"]):
+    if x.dim() == 4:
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+    elif x.dim() == 3:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    d = x.shape[-1]
+    cos_half = cos[..., :d//2]
+    sin_half = sin[..., :d//2]
+
+    cos_interleaved = cos_half.repeat_interleave(2, dim=-1)
+    sin_interleaved = sin_half.repeat_interleave(2, dim=-1)
+
+    x_reshaped = x.view(*x.shape[:-1], -1, 2)
+    x_rotated = torch.stack([-x_reshaped[..., 1], x_reshaped[..., 0]], dim=-1)
+    x_rotated = x_rotated.flatten(-2)
+    
+    x_embed = x * cos_interleaved + x_rotated * sin_interleaved
+
+    return x_embed
+
 def apply_rope(x:Float[Tensor, "... seq dim"], 
                cos:Float[Tensor, "... seq dim"], sin:Float[Tensor, "... seq dim"]):
-    cos = cos.unsqueeze(1) # [bsz 1 seq dim]
-    sin = sin.unsqueeze(1)
+    if x.dim() == 4:
+        cos = cos.unsqueeze(1) # [bsz 1 seq dim]
+        sin = sin.unsqueeze(1)
+    elif x.dim() == 3:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    # print(rotate_half(x).shape, x.shape, cos.shape)
     x_embed = x * cos + rotate_half(x) * sin
     return x_embed
 
@@ -199,6 +242,7 @@ class MHA_With_RoPE(nn.Module):
         self.k_proj = nn.Parameter(k_proj_weight)
         self.v_proj = nn.Parameter(v_proj_weight)
         self.o_proj = nn.Parameter(o_proj_weight)
+        self.num_heads = num_heads
         if q_proj_weight == None:
             d_split = d_model//num_heads
         else:
@@ -223,13 +267,14 @@ class MHA_With_RoPE(nn.Module):
 
         # 绑定rope
         cos, sin = self.rope(token_positions)
-        q_embed = apply_rope(q, cos, sin)
-        k_embed = apply_rope(k, cos, sin)
+        q_embed = test_apply_rope(q, cos, sin)
+        k_embed = test_apply_rope(k, cos, sin)
 
         seq_len = token_positions.shape[-1]
         # 计算attn out
-        mask = torch.ones(size=(seq_len, seq_len),dtype = torch.float, device = q_embed.device) * (-1e8)
-        mask = torch.triu(mask, diagonal=1)
+        mask = torch.ones(size=(seq_len, seq_len),dtype = torch.bool, device = q_embed.device)
+        mask = torch.tril(mask).unsqueeze(0).unsqueeze(0)
+
         attn_out = self.sdpa(q_embed, k_embed, v, mask)
         
         #计算最终输出
@@ -273,7 +318,7 @@ class TransformerBlock(nn.Module):
                                   weights["attn.q_proj.weight"],
                                   weights["attn.k_proj.weight"],
                                   weights["attn.v_proj.weight"],
-                                  weights["attn.o_proj.weight"])
+                                  weights["attn.output_proj.weight"])
         self.mlp = SwiGLU(d_model,
                           d_ff,
                           weights["ffn.w1.weight"],
@@ -295,7 +340,7 @@ class TransformerBlock(nn.Module):
 
         res = attn_out
 
-        in_features = self.mlp_rmsnorm(in_features)
+        in_features = self.mlp_rmsnorm(attn_out)
         mlp_out = self.mlp(in_features)
 
         return mlp_out + res
@@ -311,9 +356,8 @@ class DecoderLayer(nn.Module):
                 weights: dict[str, Tensor]) -> None:
         super().__init__()
 
-        self.attn_rmsnorm = RMSNorm(d_model, eps=1e-6, weights=weights[f"layers.{layer_idx}.ln1.weight"])
-        self.mlp_rmsnorm = RMSNorm(d_model, eps=1e-6, weights=weights[f"layers.{layer_idx}.ln2.weight"])
-
+        self.attn_rmsnorm = RMSNorm(d_model, eps=1e-8, weights=weights[f"layers.{layer_idx}.ln1.weight"])
+        self.mlp_rmsnorm = RMSNorm(d_model, eps=1e-8, weights=weights[f"layers.{layer_idx}.ln2.weight"])
         self.attn = MHA_With_RoPE(d_model,
                                   num_heads,
                                   max_seq_len,
@@ -321,7 +365,7 @@ class DecoderLayer(nn.Module):
                                   weights[f"layers.{layer_idx}.attn.q_proj.weight"],
                                   weights[f"layers.{layer_idx}.attn.k_proj.weight"],  
                                   weights[f"layers.{layer_idx}.attn.v_proj.weight"],
-                                  weights[f"layers.{layer_idx}.attn.o_proj.weight"])
+                                  weights[f"layers.{layer_idx}.attn.output_proj.weight"])
         self.mlp = SwiGLU(d_model,
                           d_ff,
                           weights[f"layers.{layer_idx}.ffn.w1.weight"],
@@ -343,7 +387,7 @@ class DecoderLayer(nn.Module):
 
         res = attn_out
 
-        in_features = self.mlp_rmsnorm(in_features)
+        in_features = self.mlp_rmsnorm(attn_out)
         mlp_out = self.mlp(in_features)
 
         return mlp_out + res
@@ -392,15 +436,231 @@ class Model(nn.Module):
         
         in_features = self.ln(in_features)
 
-        return self.lm(in_features)
+        return self.lm_head(in_features)
 
+
+class MyDataset():
+    def __init__(self, data:np.ndarray, context_length, batch_size, device):
+        # 先不添加shuffle功能
+        self.context_length = context_length + 1 # 多一个位置作为最后一个token的label
+        tmp = data.shape[0] // (batch_size * self.context_length)
+        self.length = tmp 
+        self.data = torch.LongTensor(data[:self.length *batch_size * self.context_length]).view(-1, batch_size, self.context_length)
+        self.device = device
+    
+    def __len__(self):
+        return self.length
+    
+    def __getitem__(self, index):
+        data = self.data[index].to(self.device)
+
+        return (data[:,:-1], data[:, 1:])
+    
+    def __iter__(self):
+        self.index = 0
+        return self
+    
+    def __next__(self):
+        
+        self.index += 1
+        if self.index == self.length:
+            self.index == 0
+        else:
+            self.index = self.index % self.length
+        return self[self.index]
+
+        
+class CrossEntropy(nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, inputs:torch.Tensor, targets):
+        inputs = self.softmax(inputs)
+        targets = targets[:,None]
+        logits = -1 * torch.log(inputs.gather(dim=1, index=targets)).view(-1)
+        return logits.mean()
+
+    
+class GradClipper(nn.Module):
+    def __init__(self, params) -> None:
+        super().__init__()
+        self.params = [p for p in params if p.requires_grad]
+    
+    def forward(self, max_l2_norm):
+        total_norm = 0
+        for param in self.params:
+            param:torch.Tensor
+            param_norm = param.grad.detach().data.norm(2) 
+            total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        div = max(1.0, total_norm / (max_l2_norm + 1e-6))
+        if div > 1.0:
+            # 修改参数时，虽然 grad 不在计算图中，但建议加上 no_grad 保持规范
+            with torch.no_grad():
+                for param in self.params:
+                    if param.grad is not None:
+                        param.grad.div_(div)
+        
+        return total_norm
+
+import regex as re
+
+class BPETokenizer:
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] = None):
+        self.vocab = vocab
+        self.inverse_vocab = {v: k for k, v in vocab.items()}
+        self.merges = {pair: i for i, pair in enumerate(merges)}
+        self.special_tokens = special_tokens or []
+        self.special_token_to_id = {t: self.inverse_vocab[t.encode("utf-8")] for t in self.special_tokens if t.encode("utf-8") in self.inverse_vocab}
+        
+        # regex for GPT-2 style pre-tokenization
+        self.pat = re.compile(r"""<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
+
+    def encode(self, text: str) -> list[int]:
+        tokens = []
+        for word in self.pat.findall(text):
+            if word in self.special_token_to_id:
+                tokens.append(self.special_token_to_id[word])
+            else:
+                word_bytes = list(word.encode("utf-8"))
+                word_tokens = [bytes([b]) for b in word_bytes]
+                while len(word_tokens) > 1:
+                    pairs = get_pairs(word_tokens)
+                    pair = min(pairs, key=lambda p: self.merges.get(p, float("inf")))
+                    if pair not in self.merges:
+                        break
+                    word_tokens = merge_tokens(word_tokens, pair)
+                tokens.extend([self.inverse_vocab[t] for t in word_tokens])
+        return tokens
+
+    def decode(self, ids: list[int]) -> str:
+        tokens = [self.vocab[i] for i in ids]
+        return b"".join(tokens).decode("utf-8", errors="replace")
+
+def get_pairs(word_tokens):
+    return list(zip(word_tokens[:-1], word_tokens[1:]))
+
+def merge_tokens(word_tokens, pair):
+    new_tokens = []
+    i = 0
+    while i < len(word_tokens):
+        if i < len(word_tokens) - 1 and word_tokens[i] == pair[0] and word_tokens[i+1] == pair[1]:
+            new_tokens.append(pair[0] + pair[1])
+            i += 2
+        else:
+            new_tokens.append(word_tokens[i])
+            i += 1
+    return new_tokens
+
+def finalize_counter_buffer(counter_buffer, merged_pair, pair_trace, single_token_buffer):
+    trace = set(pair_trace[merged_pair])
+    a, b = merged_pair
+    merged_bytes = a + b
+    
+    for idx in trace:
+        token = single_token_buffer[idx]
+        new_token = []
+        i = 0
+        while i < len(token):
+            if i < len(token) - 1 and token[i] == a and token[i+1] == b:
+                # 移除旧的相邻 pair 计数
+                if i > 0:
+                    prev_pair = (token[i-1], token[i])
+                    counter_buffer[prev_pair] -= 1
+                    if idx in pair_trace[prev_pair]:
+                        pair_trace[prev_pair].remove(idx)
+                if i < len(token) - 2:
+                    next_pair = (token[i+1], token[i+2])
+                    counter_buffer[next_pair] -= 1
+                    if idx in pair_trace[next_pair]:
+                        pair_trace[next_pair].remove(idx)
+                
+                # 添加新生成的 pair 计数
+                new_token.append(merged_bytes)
+                if i > 0:
+                    new_prev_pair = (token[i-1], merged_bytes)
+                    counter_buffer[new_prev_pair] = counter_buffer.get(new_prev_pair, 0) + 1
+                    pair_trace.setdefault(new_prev_pair, []).append(idx)
+                if i < len(token) - 2:
+                    new_next_pair = (merged_bytes, token[i+2])
+                    counter_buffer[new_next_pair] = counter_buffer.get(new_next_pair, 0) + 1
+                    pair_trace.setdefault(new_next_pair, []).append(idx)
+                
+                i += 2
+            else:
+                new_token.append(token[i])
+                i += 1
+        single_token_buffer[idx] = new_token
+    
+    # 彻底清除已合并的 pair 计数
+    counter_buffer[merged_pair] = 0
+    pair_trace[merged_pair] = []
+
+def train_bpe(input_path, vocab_size, special_tokens):
+    # 使用 regex 库的高效实现逻辑
+    PAT = r"""<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    
+    with open(input_path, "r", encoding="utf-8") as f:
+        data = f.read()
+    
+    tokens = re.findall(PAT, data, re.UNICODE)
+    
+    single_token_buffer = []
+    counter_buffer = {}
+    pair_trace = {}
+    
+    # 初始化：按字节切分并统计频率
+    for i, token in enumerate(tokens):
+        token_bytes = [bytes([b]) for b in token.encode("utf-8")]
+        single_token_buffer.append(token_bytes)
+        if len(token_bytes) >= 2:
+            pairs = get_pairs(token_bytes)
+            for pair in pairs:
+                counter_buffer[pair] = counter_buffer.get(pair, 0) + 1
+                pair_trace.setdefault(pair, []).append(i)
+    
+    # 建立初始词表
+    vocab = {bytes([b]): b for b in range(256)}
+    for st in special_tokens:
+        st_bytes = st.encode("utf-8")
+        if st_bytes not in vocab:
+            vocab[st_bytes] = len(vocab)
+    
+    merges = []
+    current_vocab_size = len(vocab)
+    
+    while current_vocab_size < vocab_size:
+        if not counter_buffer:
+            break
+            
+        # 寻找出现次数最多的 pair
+        best_pair = None
+        max_count = -1
+        for pair, count in counter_buffer.items():
+            if count > max_count:
+                max_count = count
+                best_pair = pair
+            elif count == max_count:
+                # 如果频率相同，可以按字节序选择，这里简单选第一个
+                continue
+        
+        if max_count <= 0 or best_pair is None:
+            break
+            
+        # 合并
+        new_token_bytes = best_pair[0] + best_pair[1]
+        merges.append(best_pair)
+        vocab[new_token_bytes] = current_vocab_size
+        current_vocab_size += 1
+        
+        finalize_counter_buffer(counter_buffer, best_pair, pair_trace, single_token_buffer)
+        
+    final_vocab = {idx: token for token, idx in vocab.items()}
+    return final_vocab, merges
 
 
         
-
-
-    
-
 
 
 
